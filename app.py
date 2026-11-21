@@ -24,7 +24,7 @@ WRONG_KEY_RESPONSE = {
 }
 # -------------------------------
 
-LIKES_PER_TOKEN_PER_DAY = 90          # ← প্রতি guest id দিনে ৩০ বার লাইক
+LIKES_PER_TOKEN_PER_DAY = 30          # ← প্রতি guest id দিনে ৩০ বার লাইক
 TOKEN_FILE = "token_bd.json"          # সব guest id এখান থেকে লোড হবে
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
