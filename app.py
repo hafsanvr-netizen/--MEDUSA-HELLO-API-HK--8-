@@ -7,8 +7,6 @@ import aiohttp
 import requests
 import json
 import os
-import base64
-import time
 import like_pb2
 import like_count_pb2
 import uid_generator_pb2
@@ -26,15 +24,13 @@ WRONG_KEY_RESPONSE = {
 }
 # -------------------------------
 
-LIKES_PER_TOKEN_PER_DAY = 30
-PROFILE_CHECK_TOKEN_COUNT = 15          # প্রথম ১৫টি টোকেন = প্রোফাইল চেক
-ALLOW_PROFILE_TOKENS_AS_FALLBACK = True # True হলে লাইক-টোকেন শেষ হলে প্রথম ১৫টাও লাইকে যাবে
-TOKEN_FILE = "token_bd.json"
+LIKES_PER_TOKEN_PER_DAY = 30          # ← প্রতি guest id দিনে ৩০ বার লাইক
+TOKEN_FILE = "token_bd.json"          # সব guest id এখান থেকে লোড হবে
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # -------------------------------
-# STATE (Vercel stateless → /tmp)
+# STATE (Vercel is stateless → /tmp ব্যবহার)
 # -------------------------------
 STATE_FILE = "/tmp/token_usage_state.json"
 state_lock = threading.Lock()
@@ -70,6 +66,7 @@ def save_state(state):
 
 
 def load_token_file(file_name):
+    """টোকেন ফাইল লোড করে। ফরম্যাট: [{"token": "..."}, ...] অথবা ["token1", ...]"""
     try:
         with open(file_name, "r") as f:
             tokens = json.load(f)
@@ -98,31 +95,6 @@ def load_all_tokens():
     return tokens
 
 
-# -------------------------------
-# JWT HELPERS (টোকেনের ভেতরের আইডি পড়া + এক্সপায়ার চেক)
-# -------------------------------
-def decode_jwt_payload(token: str) -> dict:
-    try:
-        part = token.split(".")[1]
-        part += "=" * (-len(part) % 4)
-        return json.loads(base64.urlsafe_b64decode(part))
-    except Exception:
-        return {}
-
-
-def is_token_alive(token: str) -> bool:
-    data = decode_jwt_payload(token)
-    exp = data.get("exp", 0)
-    return exp == 0 or exp > time.time()
-
-
-def token_account_id(token: str):
-    return decode_jwt_payload(token).get("account_id")
-
-
-# -------------------------------
-# CRYPTO / PROTOBUF
-# -------------------------------
 def encrypt_message(plaintext):
     key = b'Yg&tc%DEuh6%Zc^8'
     iv = b'6oyZDr22E3ychjM%'
@@ -149,9 +121,6 @@ def enc_profile_check_payload(uid):
     return encrypt_message(create_protobuf_for_profile_check(uid))
 
 
-# -------------------------------
-# HTTP CALLS
-# -------------------------------
 async def send_single_like_request(encrypted_like_payload, token_dict, url):
     edata = bytes.fromhex(encrypted_like_payload)
     token_value = token_dict.get("token", "")
@@ -228,82 +197,31 @@ def get_like_api_url(server_name):
         return "https://clientbp.ppmainecoonghj.com/LikeProfile"
 
 
-# -------------------------------
-# TOKEN SELECTION (নতুন লজিক)
-# -------------------------------
-def split_tokens(all_tokens):
-    """
-    প্রথম PROFILE_CHECK_TOKEN_COUNT টি = প্রোফাইল চেক টোকেন
-    বাকিগুলো = লাইক টোকেন
-    এক্সপায়ার হওয়া টোকেন বাদ দেওয়া হয়।
-    """
-    alive = [t for t in all_tokens if is_token_alive(t["token"])]
-    profile_tokens = alive[:PROFILE_CHECK_TOKEN_COUNT]
-    like_tokens = alive[PROFILE_CHECK_TOKEN_COUNT:]
-    return profile_tokens, like_tokens
-
-
-def get_next_profile_token(all_tokens, state):
-    """প্রোফাইল চেকের জন্য প্রথম ১৫টির মধ্যে থেকে একটি রাউন্ড-রবিন বেছে নেয়।"""
-    profile_tokens, like_tokens = split_tokens(all_tokens)
-    pool = profile_tokens if profile_tokens else like_tokens
-    if not pool:
-        return None
-    usage = state["usage"]
-    return min(pool, key=lambda t: usage.get(t["token"], 0))
-
-
 def select_tokens_for_likes(all_tokens, state):
     """
-    লাইক পাঠানোর জন্য টোকেন বেছে নেয়।
-    1) আগে শুধু লাইক-টোকেন (index >= 15) থেকে
-    2) যদি সেগুলোর লিমিট শেষ হয় এবং ALLOW_PROFILE_TOKENS_AS_FALLBACK=True,
-       তাহলে প্রথম ১৫টাও ব্যবহার করে।
+    token_bd.json এর সব guest ID ব্যবহার করে।
+    প্রতিটি টোকেন দিনে LIKES_PER_TOKEN_PER_DAY (30) বার লাইক দিতে পারবে।
+    যেগুলোর লিমিট শেষ, সেগুলো বাদ যাবে।
     """
-    profile_tokens, like_tokens = split_tokens(all_tokens)
     usage = state["usage"]
-
-    def available(tokens):
-        out = []
-        for td in tokens:
-            tok = td["token"]
-            if usage.get(tok, 0) < LIKES_PER_TOKEN_PER_DAY:
-                out.append((td, usage.get(tok, 0)))
-        return out
-
-    selected = available(like_tokens)
-    if not selected and ALLOW_PROFILE_TOKENS_AS_FALLBACK:
-        selected = available(profile_tokens)
+    selected = []
+    for token_dict in all_tokens:
+        tok = token_dict["token"]
+        used = usage.get(tok, 0)
+        if used < LIKES_PER_TOKEN_PER_DAY:
+            selected.append((token_dict, used))
     return selected
 
 
-def usage_summary(all_tokens, state):
-    """হোম/টোকেন_ইনফোতে দেখানোর জন্য সারাংশ।"""
-    profile_tokens, like_tokens = split_tokens(all_tokens)
+def get_next_profile_token(all_tokens, state):
     usage = state["usage"]
-
-    def used_count(tokens):
-        return sum(usage.get(t["token"], 0) for t in tokens)
-
-    p_used = used_count(profile_tokens)
-    l_used = used_count(like_tokens)
-    p_cap = len(profile_tokens) * LIKES_PER_TOKEN_PER_DAY
-    l_cap = len(like_tokens) * LIKES_PER_TOKEN_PER_DAY
-    return {
-        "profile_check_tokens": len(profile_tokens),
-        "like_tokens": len(like_tokens),
-        "profile_used": p_used,
-        "profile_capacity": p_cap,
-        "like_used": l_used,
-        "like_capacity": l_cap,
-        "total_used": p_used + l_used,
-        "total_capacity": p_cap + l_cap,
-    }
+    for token_dict in all_tokens:
+        tok = token_dict["token"]
+        if usage.get(tok, 0) < LIKES_PER_TOKEN_PER_DAY:
+            return token_dict
+    return all_tokens[0] if all_tokens else None
 
 
-# -------------------------------
-# FLASK APP
-# -------------------------------
 app = Flask(__name__)
 
 
@@ -312,7 +230,11 @@ def home():
     all_tokens = load_all_tokens()
     with state_lock:
         state = load_state()
-    s = usage_summary(all_tokens, state)
+        usage = state["usage"]
+
+    total_used = sum(usage.get(t["token"], 0) for t in all_tokens)
+    total_cap = len(all_tokens) * LIKES_PER_TOKEN_PER_DAY
+    remaining = max(0, total_cap - total_used)
 
     return jsonify({
         "api": "Free Fire Like API",
@@ -324,14 +246,14 @@ def home():
         "config": {
             "token_file": TOKEN_FILE,
             "total_tokens_loaded": len(all_tokens),
-            "profile_check_token_count": PROFILE_CHECK_TOKEN_COUNT,
             "likes_per_token_per_day": LIKES_PER_TOKEN_PER_DAY,
-            "fallback_enabled": ALLOW_PROFILE_TOKENS_AS_FALLBACK
+            "daily_capacity": total_cap
         },
         "today_usage": {
             "date_utc": state.get("date"),
-            **s,
-            "remaining": max(0, s["total_capacity"] - s["total_used"]),
+            "used": total_used,
+            "capacity": total_cap,
+            "remaining": remaining
         },
         "credits": "@HAFSAN_KUN"
     })
@@ -361,14 +283,14 @@ def handle_requests():
 
     profile_token = get_next_profile_token(all_tokens, state)
     if not profile_token:
-        return jsonify({"error": "No alive token for profile check."}), 500
+        return jsonify({"error": "No token for profile check."}), 500
 
-    # before snapshot
     enc_uid = enc_profile_check_payload(uid_param)
     before_info = make_profile_check_request(enc_uid, server_name_param, profile_token)
     before_likes = int(before_info.AccountInfo.Likes) if (before_info and hasattr(before_info, 'AccountInfo')) else 0
     print(f"UID {uid_param}: before = {before_likes}")
 
+    # token_bd.json এর সব guest ID ব্যবহার করবে (যাদের 30/দিন লিমিট বাকি)
     with state_lock:
         state = load_state()
         selected = select_tokens_for_likes(all_tokens, state)
@@ -381,7 +303,7 @@ def handle_requests():
             "PlayerNickname": "N/A",
             "UID": int(uid_param),
             "status": 2,
-            "message": f"All tokens reached daily limit ({LIKES_PER_TOKEN_PER_DAY}/token/day).",
+            "message": f"All tokens reached daily limit ({LIKES_PER_TOKEN_PER_DAY}/token/day). Try again tomorrow (UTC).",
             "credits": "@HAFSAN_KUN"
         })
 
@@ -414,34 +336,38 @@ def handle_requests():
                 success_count += 1
         save_state(state)
 
-    # after snapshot
     after_info = make_profile_check_request(enc_uid, server_name_param, profile_token)
     after_likes = int(after_info.AccountInfo.Likes) if (after_info and hasattr(after_info, 'AccountInfo')) else before_likes
-
     nickname = "N/A"
-    if after_info and hasattr(after_info, 'AccountInfo') and after_info.AccountInfo.PlayerNickname:
-        nickname = str(after_info.AccountInfo.PlayerNickname)
+    actual_uid = int(uid_param)
+    if after_info and hasattr(after_info, 'AccountInfo'):
+        actual_uid = int(after_info.AccountInfo.UID)
+        if after_info.AccountInfo.PlayerNickname:
+            nickname = str(after_info.AccountInfo.PlayerNickname)
 
-    # ✅ লাইক রেজাল্ট এখন success_count ভিত্তিক (আগের before/after তুলনা ভুল ছিল)
-    status = 1 if success_count > 0 else 2
+    increment = after_likes - before_likes
+    status = 1 if increment > 0 else 2
 
     with state_lock:
         state = load_state()
-    s = usage_summary(all_tokens, state)
+        usage = state["usage"]
+    total_used = sum(usage.values())
+    total_cap = len(all_tokens) * LIKES_PER_TOKEN_PER_DAY
+    remaining = max(0, total_cap - total_used)
 
     return jsonify({
-        "LikesGivenByAPI": success_count,
+        "LikesGivenByAPI": increment,
         "LikesafterCommand": after_likes,
         "LikesbeforeCommand": before_likes,
         "PlayerNickname": nickname,
-        "UID": int(uid_param),                 # ✅ ইউজারের দেওয়া UID ফেরত
+        "UID": actual_uid,
         "status": status,
-        "ProfileCheckedWith": token_account_id(profile_token["token"]),
         "TokensUsedThisRequest": len(selected),
         "SuccessfulSends": success_count,
         "DailyUsage": {
-            **s,
-            "remaining": max(0, s["total_capacity"] - s["total_used"]),
+            "used": total_used,
+            "capacity": total_cap,
+            "remaining": remaining
         },
         "credits": "@HAFSAN_KUN"
     })
@@ -458,39 +384,38 @@ def token_info():
         state = load_state()
         usage = state["usage"]
 
-    profile_tokens, like_tokens = split_tokens(all_tokens)
-    s = usage_summary(all_tokens, state)
+    used = sum(usage.get(t["token"], 0) for t in all_tokens)
+    cap = len(all_tokens) * LIKES_PER_TOKEN_PER_DAY
+    remaining = max(0, cap - used)
 
-    def describe(tokens, role):
-        rows = []
-        for t in tokens:
-            tok = t["token"]
-            u = usage.get(tok, 0)
-            rows.append({
-                "account_id": token_account_id(tok),
-                "role": role,
-                "token_preview": tok[:8] + "..." if len(tok) > 8 else tok,
-                "used": u,
-                "remaining": max(0, LIKES_PER_TOKEN_PER_DAY - u),
-                "exhausted": u >= LIKES_PER_TOKEN_PER_DAY,
-                "alive": is_token_alive(tok),
-            })
-        return rows
+    per_token_status = []
+    for t in all_tokens:
+        tok = t["token"]
+        u = usage.get(tok, 0)
+        per_token_status.append({
+            "token_preview": tok[:8] + "..." if len(tok) > 8 else tok,
+            "used": u,
+            "remaining": max(0, LIKES_PER_TOKEN_PER_DAY - u),
+            "exhausted": u >= LIKES_PER_TOKEN_PER_DAY
+        })
+
+    active_tokens = sum(1 for t in all_tokens if usage.get(t["token"], 0) < LIKES_PER_TOKEN_PER_DAY)
 
     return jsonify({
         "date_utc": state.get("date"),
         "file": TOKEN_FILE,
+        "total": {
+            "tokens": len(all_tokens),
+            "active_tokens": active_tokens,
+            "exhausted_tokens": len(all_tokens) - active_tokens,
+            "used_today": used,
+            "capacity_today": cap,
+            "remaining_today": remaining
+        },
         "config": {
-            "LIKES_PER_TOKEN_PER_DAY": LIKES_PER_TOKEN_PER_DAY,
-            "PROFILE_CHECK_TOKEN_COUNT": PROFILE_CHECK_TOKEN_COUNT,
-            "ALLOW_PROFILE_TOKENS_AS_FALLBACK": ALLOW_PROFILE_TOKENS_AS_FALLBACK,
+            "LIKES_PER_TOKEN_PER_DAY": LIKES_PER_TOKEN_PER_DAY
         },
-        "summary": {
-            **s,
-            "remaining": max(0, s["total_capacity"] - s["total_used"]),
-        },
-        "profile_check_tokens": describe(profile_tokens, "profile_check"),
-        "like_tokens": describe(like_tokens, "like"),
+        "tokens": per_token_status,
         "credits": "@HAFSAN_KUN"
     })
 
